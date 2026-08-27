@@ -228,7 +228,10 @@ async def create_tables():
     logger.info("Database tables created.")
 
 
+async def main():
+    await create_tables()
+    await seed_database()
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(create_tables())
-    asyncio.run(seed_database())
+    asyncio.run(main())
