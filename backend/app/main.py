@@ -22,6 +22,7 @@ from app.api.integrations import router as integrations_router
 from app.api.ai import router as ai_router
 from app.api.telemetry import router as telemetry_router
 from app.api.ws import router as ws_router
+from app.api.rag import router as rag_router
 
 # Configure logging
 logging.basicConfig(
@@ -89,6 +90,7 @@ app.include_router(integrations_router)
 app.include_router(ai_router)
 app.include_router(telemetry_router)
 app.include_router(ws_router)
+app.include_router(rag_router)
 
 
 # ── Root & Health Endpoints ──────────────────────────────────────────────────

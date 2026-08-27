@@ -1,13 +1,18 @@
 """
 AI Investigator — orchestrates the LLM-powered root cause analysis pipeline.
 
+Architecture:
+  1. RAG retrieves relevant code from the codebase
+  2. Chain-of-Thought system prompt structures reasoning
+  3. LLM analyzes telemetry + code context
+  4. Generates structured repair proposal
+  5. Falls back to deterministic templates when no API key
+
 When an AI API key is not configured, uses a deterministic fallback
 that simulates the analysis with realistic SRE responses.
 """
-import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Optional
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +24,11 @@ from app.models.timeline_event import TimelineEvent
 from app.models.repair_proposal import RepairProposal
 from app.models.ai_config import AIConfig
 from app.config import settings
+from app.services.prompts import (
+    INVESTIGATION_SYSTEM_PROMPT,
+    CODEBASE_ANALYSIS_PROMPT,
+)
+from app.services.rag_engine import get_rag_pipeline
 
 logger = logging.getLogger("acom.ai_investigator")
 
@@ -30,32 +40,45 @@ INVESTIGATION_TEMPLATES = {
         "steps": [
             {
                 "description": "Check payment-gateway health endpoints",
-                "output": "Found 500 Internal Server Error responses on POST /v1/checkout/process. "
-                          "Error rate: 38.2% over 5-minute window, significantly exceeding 5% threshold.",
+                "output": (
+                    "Found 500 Internal Server Error responses on POST /v1/checkout/process. "
+                    "Error rate: 38.2% over 5-minute window, exceeding 5% threshold."
+                ),
             },
             {
                 "description": "Analyze Datadog metrics for correlated anomalies",
-                "output": "Error rate spike began at 14:28 UTC, exactly correlating with Deploy v42 "
-                          "(commit #a8f42). Latency p99 jumped from 120ms to 928ms simultaneously.",
+                "output": (
+                    "Error rate spike began at 14:28 UTC, correlating with Deploy v42 "
+                    "(commit #a8f42). Latency p99 jumped from 120ms to 928ms."
+                ),
             },
             {
-                "description": "Correlate database connection behavior with max_connections env var change",
-                "output": "Deploy v42 modified db.py to read DB_POOL_SIZE from environment: "
-                          "max_connections=int(os.environ.get('DB_POOL_SIZE', 250)). Previous hard-coded "
-                          "value was 50. This 5x increase saturated Postgres connection pool (248/250 active). "
-                          "Connection timeout was not updated, causing cascading failures.",
+                "description": "Correlate database connection behavior with config change",
+                "output": (
+                    "Deploy v42 modified db.py: max_connections=int(os.environ.get("
+                    "'DB_POOL_SIZE', 250)). Previous value was 50. This 5x increase "
+                    "saturated Postgres connection pool (248/250 active). "
+                    "Connection timeout was not updated, causing cascading failures."
+                ),
             },
         ],
-        "hypothesis": "Deployment v2.4.1 introduced database connection pool limit mismatch. "
-                      "Pool size increased from 50 to 250 without updating connection timeout limits, "
-                      "causing Postgres connection exhaustion.",
+        "hypothesis": (
+            "Deployment v2.4.1 introduced database connection pool limit mismatch. "
+            "Pool size increased from 50 to 250 without updating connection timeout "
+            "limits, causing Postgres connection exhaustion."
+        ),
         "confidence": 94.0,
         "repair": {
             "title": "Patch database connection cleanup",
-            "description": "Revert max_connections to 50 and add proper connection timeout configuration.",
-            "why": "Deploy v42 increased pool size without updating connection timeout limits, "
-                   "causing Postgres connection exhaustion.",
-            "expected_result": "Immediate recovery of checkout flow; DB connections stabilize at ~80% capacity.",
+            "description": "Revert max_connections to 50 and add proper connection timeout.",
+            "why": (
+                "Deploy v42 increased pool size without updating connection timeout "
+                "limits, causing Postgres connection exhaustion."
+            ),
+            "expected_result": (
+                "Immediate recovery of checkout flow; "
+                "DB connections stabilize at ~80% capacity."
+            ),
             "risk_level": "Low",
             "patch_diff": (
                 "--- a/services/payment/db.py\n"
@@ -77,24 +100,24 @@ DEFAULT_TEMPLATE = {
     "steps": [
         {
             "description": "Check affected service health endpoints",
-            "output": "Service responding with elevated error rates. HTTP 500 responses detected.",
+            "output": "Service responding with elevated error rates. HTTP 500s detected.",
         },
         {
             "description": "Analyze metrics for correlated anomalies",
-            "output": "Error spike correlates with recent deployment or configuration change.",
+            "output": "Error spike correlates with recent deployment or config change.",
         },
         {
             "description": "Identify root cause from logs and traces",
-            "output": "Root cause identified: configuration change introduced during recent deployment.",
+            "output": "Root cause: configuration change during recent deployment.",
         },
     ],
-    "hypothesis": "Recent deployment introduced a configuration change that caused service degradation.",
+    "hypothesis": "Recent deployment introduced a configuration change causing degradation.",
     "confidence": 85.0,
     "repair": {
         "title": "Revert problematic configuration change",
-        "description": "Rollback the configuration to the previous known-good state.",
+        "description": "Rollback to the previous known-good state.",
         "why": "Recent configuration change introduced instability.",
-        "expected_result": "Service stability restored within 2-5 minutes of rollback.",
+        "expected_result": "Service stability restored within 2-5 minutes.",
         "risk_level": "Low",
         "patch_diff": "# Rollback to previous configuration",
         "confidence": 85.0,
@@ -102,46 +125,45 @@ DEFAULT_TEMPLATE = {
 }
 
 
-async def _try_llm_investigation(incident: Incident, ai_config: Optional[AIConfig]) -> Optional[dict]:
+async def _try_llm_investigation(
+    incident: Incident,
+    ai_config: AIConfig | None,
+    rag_context: str = "",
+) -> dict | None:
     """
-    Attempt to call the LLM API for real AI investigation.
+    Call the LLM API with CoT system prompt + RAG context.
     Returns None if the API is not configured or fails.
     """
     api_key = settings.AI_API_KEY
-    if not api_key or api_key == "sk-placeholder" or api_key == "sk-your-api-key-here":
+    if not api_key or api_key in ("sk-placeholder", "sk-your-api-key-here"):
         return None
 
     try:
         base_url = settings.AI_BASE_URL
         model = settings.AI_DEFAULT_MODEL
-
         if ai_config:
             base_url = ai_config.base_url or base_url
             model = ai_config.default_model or model
 
-        system_prompt = (
-            "You are an expert SRE AI assistant specialized in incident root cause analysis. "
-            "Analyze the incident data and provide: 1) Investigation steps taken, "
-            "2) Root cause hypothesis, 3) Confidence level (0-100), "
-            "4) Repair recommendation with risk level."
+        # Build the Chain-of-Thought user message with RAG context
+        service_name = incident.service.name if incident.service else "unknown"
+        user_prompt = CODEBASE_ANALYSIS_PROMPT.format(
+            rag_context=rag_context or "No codebase indexed yet.",
+            incident_id=incident.incident_id,
+            service_name=service_name,
+            incident_title=incident.title,
+            severity=incident.severity,
+            error_rate=incident.error_rate or "N/A",
+            p99_latency=incident.p99_latency_ms or "N/A",
+            endpoint=incident.impacted_endpoint or "N/A",
         )
 
+        # Use custom system prompt if configured, else our CoT prompt
+        system_prompt = INVESTIGATION_SYSTEM_PROMPT
         if ai_config and ai_config.system_prompt_enabled and ai_config.system_prompt:
             system_prompt = ai_config.system_prompt
 
-        user_prompt = (
-            f"Analyze this production incident:\n"
-            f"- Incident: {incident.incident_id}\n"
-            f"- Title: {incident.title}\n"
-            f"- Severity: {incident.severity}\n"
-            f"- Service: {incident.service.name if incident.service else 'unknown'}\n"
-            f"- Error Rate: {incident.error_rate}%\n"
-            f"- p99 Latency: {incident.p99_latency_ms}ms\n"
-            f"- Impacted Endpoint: {incident.impacted_endpoint}\n\n"
-            f"Provide your analysis as a structured JSON response."
-        )
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -151,37 +173,45 @@ async def _try_llm_investigation(incident: Incident, ai_config: Optional[AIConfi
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.3,
-                    "max_tokens": 2000,
+                    "temperature": 0.2,
+                    "max_tokens": 4000,
                 },
             )
             response.raise_for_status()
             data = response.json()
             content = data["choices"][0]["message"]["content"]
             logger.info("LLM investigation completed successfully")
-            return {"raw_output": content}
+            return {"raw_output": content, "model": model}
 
     except Exception as e:
-        logger.warning(f"LLM API call failed, falling back to deterministic analysis: {e}")
+        logger.warning(f"LLM API call failed: {e}")
         return None
 
 
-async def run_investigation(
-    db: AsyncSession,
-    incident: Incident,
-) -> dict:
+async def run_investigation(db: AsyncSession, incident: Incident) -> dict:
     """
-    Run the full AI investigation pipeline for an incident.
-    Uses LLM if available, otherwise falls back to deterministic templates.
+    Run the full AI investigation pipeline:
+    1. RAG retrieval for code context
+    2. LLM analysis with CoT prompting
+    3. Deterministic fallback if no API key
+    4. Persist investigation steps + repair proposal
     """
     service_name = incident.service.name if incident.service else "unknown"
 
-    # Try to get AI config
+    # Get AI config
     ai_config_result = await db.execute(select(AIConfig).limit(1))
     ai_config = ai_config_result.scalar_one_or_none()
 
-    # Attempt LLM-based investigation
-    llm_result = await _try_llm_investigation(incident, ai_config)
+    # RAG: Retrieve relevant code context
+    rag = get_rag_pipeline()
+    rag_context = ""
+    if rag.indexed:
+        query = f"{incident.title} {service_name} {incident.impacted_endpoint or ''}"
+        rag_context = rag.build_context(query, top_k=8, max_tokens=6000)
+        logger.info(f"RAG retrieved context ({len(rag_context)} chars) for {incident.incident_id}")
+
+    # Try LLM-based investigation
+    llm_result = await _try_llm_investigation(incident, ai_config, rag_context)
 
     # Select template for deterministic fallback
     template = INVESTIGATION_TEMPLATES.get(service_name, DEFAULT_TEMPLATE)
@@ -190,17 +220,20 @@ async def run_investigation(
     incident.status = "Investigating"
     incident.pipeline_step = 2
 
-    # Add investigation timeline event
     event = TimelineEvent(
         incident_id=incident.id,
         event_type="AI",
         title="AI investigation started",
-        description=f"Automated root cause analysis initiated for {incident.incident_id}.",
+        description=(
+            f"Automated root cause analysis initiated for {incident.incident_id}. "
+            f"RAG context: {len(rag_context)} chars. "
+            f"LLM: {'active' if llm_result else 'fallback mode'}."
+        ),
     )
     db.add(event)
     await db.commit()
 
-    # Create investigation steps (with simulated delay for realism)
+    # Create investigation steps
     for idx, step_data in enumerate(template["steps"], start=1):
         step = InvestigationStep(
             incident_id=incident.id,
@@ -211,13 +244,23 @@ async def run_investigation(
         )
         db.add(step)
 
+    # If LLM responded, add its full output as a step
+    if llm_result:
+        step = InvestigationStep(
+            incident_id=incident.id,
+            step_order=len(template["steps"]) + 1,
+            description="LLM Chain-of-Thought analysis",
+            status="completed",
+            ai_output=llm_result["raw_output"],
+        )
+        db.add(step)
+
     # Update incident with root cause
     incident.status = "Root Cause"
     incident.pipeline_step = 3
     incident.root_cause_hypothesis = template["hypothesis"]
     incident.ai_confidence = template["confidence"]
 
-    # Add root cause timeline event
     root_cause_event = TimelineEvent(
         incident_id=incident.id,
         event_type="AI",
@@ -242,7 +285,6 @@ async def run_investigation(
     )
     db.add(proposal)
 
-    # Update incident to repair stage
     incident.status = "Repair"
     incident.pipeline_step = 4
     incident.correlated_pr = "PR #1042"
@@ -256,7 +298,9 @@ async def run_investigation(
         "pipeline_step": incident.pipeline_step,
         "hypothesis": template["hypothesis"],
         "confidence": template["confidence"],
-        "steps_completed": len(template["steps"]),
+        "steps_completed": len(template["steps"]) + (1 if llm_result else 0),
         "repair_proposal_generated": True,
         "llm_used": llm_result is not None,
+        "rag_context_chars": len(rag_context),
+        "rag_indexed": rag.indexed,
     }
